@@ -1,14 +1,15 @@
 import json
 import re
 import time
+import urllib.parse
 from http.cookiejar import Cookie
-from urllib.parse import parse_qs, urlparse
 
 from .common import InfoExtractor
 from ..utils import (
     int_or_none,
     unified_strdate,
 )
+from ..utils.traversal import traverse_obj
 
 
 class BeeldenGeluidIE(InfoExtractor):
@@ -34,8 +35,8 @@ class BeeldenGeluidIE(InfoExtractor):
         The CDN requires CloudFront cookies (not URL params) for authentication.
         Sets cookies in the cookie jar and returns the base URL (without query params).
         """
-        parsed = urlparse(m3u8_url)
-        params = parse_qs(parsed.query)
+        parsed = urllib.parse.urlparse(m3u8_url)
+        params = urllib.parse.parse_qs(parsed.query)
         domain = parsed.hostname
 
         # Extract asset root path (e.g. /KREATIEFMETKU-HRE0000341A/)
@@ -117,12 +118,12 @@ class BeeldenGeluidIE(InfoExtractor):
             self.raise_no_formats('No working stream found')
 
         # Extract metadata from BFF response
-        series_title = program.get('series', {}).get('title')
+        series_title = traverse_obj(program, ('series', 'title'))
         episode_title = program.get('name')
         title = f'{series_title} - {episode_title}' if series_title and episode_title else (
             series_title or episode_title or video_id)
 
-        thumbnail = program.get('image', {}).get('url')
+        thumbnail = traverse_obj(program, ('image', 'url'))
         duration = int_or_none(program.get('duration'))
         # duration from API is in minutes, convert to seconds
         if duration:
