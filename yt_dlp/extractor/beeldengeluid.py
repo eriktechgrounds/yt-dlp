@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from http.cookiejar import Cookie
@@ -27,15 +28,19 @@ class BeeldenGeluidIE(InfoExtractor):
         },
     }]
 
-    def _set_cloudfront_cookies(self, m3u8_url):
-        """Extract CloudFront signed URL parameters and set them as cookies.
+    def _prepare_cloudfront_request(self, m3u8_url):
+        """Extract CloudFront signed URL parameters and set them as path-scoped cookies.
 
-        The CDN converts URL query parameters to signed cookies via a 302 redirect.
-        We set the cookies directly to avoid redirect-handling issues.
+        The CDN requires CloudFront cookies (not URL params) for authentication.
+        Sets cookies in the cookie jar and returns the base URL (without query params).
         """
         parsed = urlparse(m3u8_url)
         params = parse_qs(parsed.query)
         domain = parsed.hostname
+
+        # Extract asset root path (e.g. /KREATIEFMETKU-HRE0000341A/)
+        path_parts = parsed.path.split('/')
+        cookie_path = f'/{path_parts[1]}/' if len(path_parts) > 1 else '/'
 
         for param_name in ('CloudFront-Policy', 'CloudFront-Signature', 'CloudFront-Key-Pair-Id'):
             value = params.get(param_name, [None])[0]
@@ -44,7 +49,7 @@ class BeeldenGeluidIE(InfoExtractor):
                     version=0, name=param_name, value=value,
                     port=None, port_specified=False,
                     domain=f'.{domain.split(".", 1)[1]}', domain_specified=True, domain_initial_dot=True,
-                    path='/', path_specified=True,
+                    path=cookie_path, path_specified=True,
                     secure=True, expires=int(time.time()) + 3600,
                     discard=False, comment=None, comment_url=None, rest={}, rfc2109=False,
                 )
@@ -52,69 +57,104 @@ class BeeldenGeluidIE(InfoExtractor):
 
         return f'{parsed.scheme}://{parsed.netloc}{parsed.path}'
 
+    _STREAM_ACTION_ID = '6099b784686c7da80c0e418528160e82b7eced6e34'
+
+    def _fetch_fresh_streams(self, url, video_id):
+        """Fetch fresh stream URLs via Next.js Server Action (getProgramStreamById)."""
+        data = self._download_webpage(
+            url, video_id,
+            note='Fetching fresh stream data via server action',
+            data=json.dumps([video_id, False]).encode(),
+            headers={
+                'Content-Type': 'text/plain;charset=UTF-8',
+                'Next-Action': self._STREAM_ACTION_ID,
+                'Accept': 'text/x-component',
+            })
+
+        # Response is RSC flight data with T-chunks: "N:Thex_size,<content>"
+        # The hex_size indicates exact byte count of content, preventing boundary corruption
+        m3u8_urls = []
+        for m in re.finditer(r'(\d+):T([0-9a-f]+),', data):
+            size = int(m.group(2), 16)
+            start = m.end()
+            content = data[start:start + size]
+            if 'sk-video.cdn.beeldengeluid.nl' in content and '.m3u8' in content:
+                m3u8_urls.append(content.strip())
+
+        return m3u8_urls
+
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
         video_id = mobj.group('id')
 
-        webpage = self._download_webpage(url, video_id)
+        # Fetch metadata from BFF API
+        meta = self._download_json(
+            f'https://schatkamer.beeldengeluid.nl/api/media/bff/programs/{video_id}',
+            video_id, note='Downloading metadata')
+        program = meta.get('data', meta)
 
-        # Extract m3u8 URL from RSC (React Server Components) inline data
-        # The URL uses \u0026 for & characters in the HTML source
-        m3u8_url = self._search_regex(
-            r'(https://sk-video\.cdn\.beeldengeluid\.nl/[^\s"]+\.m3u8[^\s"]*)',
-            webpage, 'stream url')
-        m3u8_url = m3u8_url.replace('\\u0026', '&')
+        # Fetch fresh stream URLs via Server Action
+        m3u8_urls = self._fetch_fresh_streams(url, video_id)
 
-        # The CDN uses a Lambda@Edge function that converts signed URL params
-        # to signed cookies via a 302 redirect. Set cookies directly.
-        base_m3u8_url = self._set_cloudfront_cookies(m3u8_url)
+        if not m3u8_urls:
+            self.raise_no_formats('No stream URLs found')
 
-        formats = self._extract_m3u8_formats(base_m3u8_url, video_id, 'mp4', m3u8_id='hls')
+        # Extract formats from each stream URL
+        all_stream_formats = []
+        for m3u8_raw in m3u8_urls:
+            m3u8_url = m3u8_raw.replace('\\u0026', '&')
 
-        # Extract metadata from embedded RSC data
-        episode_title = self._search_regex(
-            r'\\"id\\":\\"' + re.escape(video_id) + r'\\",\\"name\\":\\"([^\\"]+)\\"',
-            webpage, 'episode title', default=None)
+            # CDN requires CloudFront cookies (not URL params) for authentication.
+            # Set path-scoped cookies in jar, then request with base URL only.
+            base_m3u8_url = self._prepare_cloudfront_request(m3u8_url)
 
-        series_title = self._search_regex(
-            r'\\"series\\":\{\\"id\\":\\"[^\\"]+\\",\\"title\\":\\"([^\\"]+)\\"',
-            webpage, 'series title', default=None)
+            fmts = self._extract_m3u8_formats(
+                base_m3u8_url, video_id, 'mp4', m3u8_id='hls', fatal=False)
+            if fmts:
+                all_stream_formats.append(fmts)
 
+        if not all_stream_formats:
+            self.raise_no_formats('No working stream found')
+
+        # Extract metadata from BFF response
+        series_title = program.get('series', {}).get('title')
+        episode_title = program.get('name')
         title = f'{series_title} - {episode_title}' if series_title and episode_title else (
-            series_title or episode_title or self._html_extract_title(webpage))
+            series_title or episode_title or video_id)
 
-        description = self._search_regex(
-            r'\\"id\\":\\"' + re.escape(video_id)
-            + r'\\",\\"name\\":\\"[^\\"]+\\",\\"start\\":[^,]+,\\"title\\":\\"[^\\"]+\\",\\"description\\":\\"((?:[^\\"]+|\\\\.)*)\\"',
-            webpage, 'description', default=None)
-        if description:
-            description = description.replace('\\\\n', '\n')
+        thumbnail = program.get('image', {}).get('url')
+        duration = int_or_none(program.get('duration'))
+        # duration from API is in minutes, convert to seconds
+        if duration:
+            duration = duration * 60
 
-        upload_date = unified_strdate(self._search_regex(
-            r'\\"publishedAtISO\\":\\"([^\\"]+)\\"',
-            webpage, 'upload date', default=None))
-
-        duration = int_or_none(self._search_regex(
-            r'\\"durationNumber\\":(\d+)',
-            webpage, 'duration', default=None))
-
-        thumbnail = self._search_regex(
-            r'\\"poster\\":\\"(https://sk-video[^\\"]+)\\"',
-            webpage, 'thumbnail', default=None)
-
-        episode_number = int_or_none(self._search_regex(
-            r'\\"episodeNumber\\":(\d+)',
-            webpage, 'episode number', default=None))
-
-        return {
-            'id': video_id,
-            'title': title,
-            'description': description,
-            'upload_date': upload_date,
-            'duration': duration,
+        common_info = {
+            'description': program.get('description'),
+            'upload_date': unified_strdate(program.get('publishedAt')),
             'thumbnail': thumbnail,
             'series': series_title,
             'episode': episode_title,
-            'episode_number': episode_number,
-            'formats': formats,
         }
+
+        # Single stream: return directly
+        if len(all_stream_formats) == 1:
+            return {
+                'id': video_id,
+                'title': title,
+                'duration': duration,
+                'formats': all_stream_formats[0],
+                **common_info,
+            }
+
+        # Multiple streams: return as playlist with _1, _2 suffixes
+        entries = []
+        for idx, fmts in enumerate(all_stream_formats, 1):
+            entries.append({
+                'id': f'{video_id}_{idx}',
+                'title': f'{title}_{idx}',
+                'duration': duration,
+                'formats': fmts,
+                **common_info,
+            })
+
+        return self.playlist_result(entries, video_id, title)
